@@ -1,7 +1,7 @@
 -- Enable pgvector
 create extension if not exists vector;
 
--- Drop and recreate table with 384 dimensions
+-- Drop and recreate table with 768 dimensions
 drop table if exists compliance_chunks;
 
 create table compliance_chunks (
@@ -9,12 +9,12 @@ create table compliance_chunks (
   content text not null,
   framework text not null,
   metadata jsonb,
-  embedding vector(384)
+  embedding vector(768)
 );
 
 -- Create similarity search function
 create or replace function match_compliance_chunks(
-  query_embedding vector(384),
+  query_embedding vector(768),
   match_framework text,
   match_count int default 3
 )

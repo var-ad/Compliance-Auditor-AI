@@ -12,7 +12,7 @@ from supabase import create_client
 
 GDPR_URL = "https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:32016R0679"
 DPDP_URL = "https://www.dpdpa.com/DPDP_Rules_2025_English_only.pdf"
-MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+MODEL = SentenceTransformer("BAAI/bge-base-en-v1.5")
 
 
 async def fetch_bytes(url: str) -> bytes:

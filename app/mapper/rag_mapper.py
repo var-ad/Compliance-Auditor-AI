@@ -8,7 +8,7 @@ from supabase import create_client
 
 from app.graph.state import Finding, MappedControl
 
-MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+MODEL = SentenceTransformer("BAAI/bge-base-en-v1.5")
 
 
 def get_embedding(text: str) -> list[float]:
@@ -54,6 +54,8 @@ async def map_finding_gdpr_dpdp(finding: Finding) -> list[MappedControl]:
                     "You are a compliance expert.\n"
                     f"Security finding: {finding['description']}\n"
                     f"Relevant {framework.upper()} provision: {chunk['content']}\n"
+                    "If this provision is not directly relevant to the finding, respond with: "
+                    '"NOT_RELEVANT"\n'
                     "Explain in 2 sentences why this finding is relevant to this provision.\n"
                     "Be specific. Reference the article/rule number."
                 )
@@ -61,6 +63,10 @@ async def map_finding_gdpr_dpdp(finding: Finding) -> list[MappedControl]:
                     model="llama-3.3-70b-versatile",
                     messages=[{"role": "user", "content": prompt}],
                 )
+                explanation = response.choices[0].message.content or ""
+                if explanation.strip().upper() == "NOT_RELEVANT":
+                    continue
+
                 metadata = chunk.get("metadata") or {}
                 mapped_controls.append(
                     {
@@ -68,7 +74,7 @@ async def map_finding_gdpr_dpdp(finding: Finding) -> list[MappedControl]:
                         "framework": metadata.get("framework", chunk.get("framework", framework)),
                         "control_id": chunk["id"],
                         "control_name": chunk["content"].splitlines()[0],
-                        "explanation": response.choices[0].message.content or "",
+                        "explanation": explanation,
                     }
                 )
 
