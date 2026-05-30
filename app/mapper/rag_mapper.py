@@ -64,7 +64,7 @@ async def map_finding_gdpr_dpdp(finding: Finding) -> list[MappedControl]:
                     messages=[{"role": "user", "content": prompt}],
                 )
                 explanation = response.choices[0].message.content or ""
-                if explanation.strip().upper() == "NOT_RELEVANT":
+                if "NOT_RELEVANT" in explanation:
                     continue
 
                 metadata = chunk.get("metadata") or {}
