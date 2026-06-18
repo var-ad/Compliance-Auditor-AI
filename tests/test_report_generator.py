@@ -11,7 +11,7 @@ from tests.conftest import make_finding, make_mapped_control
 class TestSeverityBreakdown:
     def test_empty(self):
         assert _severity_breakdown([]) == {
-            "critical": 0, "high": 0, "medium": 0, "low": 0
+            "critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0
         }
 
     def test_single_finding(self):
@@ -53,7 +53,7 @@ class TestPerFrameworkScores:
         f = make_finding(rule_id="rule.1", severity="critical")
         controls = [make_mapped_control(f, framework="soc2")]
         scores = _per_framework_scores(controls)
-        assert scores["soc2"] == 75  # 100 - 25
+        assert scores["soc2"] == 80  # 100 - 20
         assert scores["iso27001"] == 100  # untouched
 
     def test_multiple_severities(self):
@@ -66,7 +66,7 @@ class TestPerFrameworkScores:
             make_mapped_control(f3, framework="soc2"),
         ]
         scores = _per_framework_scores(controls)
-        assert scores["soc2"] == max(0, 100 - 25 - 15 - 7)  # 53
+        assert scores["soc2"] == max(0, 100 - 20 - 10 - 3)  # 67
 
 
 class TestWeightedScore:

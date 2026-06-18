@@ -32,21 +32,69 @@ def _run_osv_sync(repo_path: str) -> list[Finding]:
         )
 
     data = json.loads(stdout_str)
-    findings: list[Finding] = []
+
+    # Group vulnerabilities by package to deduplicate noisy multi-CVE findings
+    SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+    packages: dict[str, dict] = {}
+
     for scan_result in data.get("results", []):
-        for package in scan_result.get("packages", []):
-            for vuln in package.get("vulnerabilities", []):
-                vuln_id = vuln["id"]
-                findings.append(
-                    {
-                        "tool": "osv",
-                        "severity": _severity(vuln),
-                        "title": vuln_id,
-                        "description": vuln.get("summary", vuln_id),
-                        "file_path": None,
-                        "rule_id": vuln_id,
-                    }
-                )
+        for pkg in scan_result.get("packages", []):
+            pkg_name = (pkg.get("package") or {}).get("name") or "unknown"
+            if pkg_name not in packages:
+                packages[pkg_name] = {
+                    "max_severity": "info",
+                    "max_severity_score": 0,
+                    "vulns": [],
+                    "purl": (pkg.get("package") or {}).get("purl", ""),
+                }
+
+            for vuln in pkg.get("vulnerabilities", []):
+                sev = _severity(vuln)
+                sev_score = SEVERITY_RANK.get(sev, 0)
+                if sev_score > packages[pkg_name]["max_severity_score"]:
+                    packages[pkg_name]["max_severity"] = sev
+                    packages[pkg_name]["max_severity_score"] = sev_score
+                packages[pkg_name]["vulns"].append(vuln)
+
+    findings: list[Finding] = []
+    for pkg_name, info in packages.items():
+        vulns = info["vulns"]
+        if len(vulns) == 1:
+            v = vulns[0]
+            findings.append(
+                {
+                    "tool": "osv",
+                    "severity": info["max_severity"],
+                    "title": v["id"],
+                    "description": v.get("summary", v["id"]),
+                    "file_path": None,
+                    "rule_id": v["id"],
+                }
+            )
+        else:
+            # Group multiple CVEs for the same package into one finding
+            cve_ids = [v["id"] for v in vulns]
+            summaries = [v.get("summary", "") for v in vulns if v.get("summary")]
+            # Use the most descriptive summary as the "title" description
+            top_cves = cve_ids[:3]
+            others_count = len(cve_ids) - 3
+            cve_list = ", ".join(top_cves)
+            if others_count > 0:
+                cve_list += f" (+{others_count} more)"
+
+            findings.append(
+                {
+                    "tool": "osv",
+                    "severity": info["max_severity"],
+                    "title": f"{pkg_name}: {len(vulns)} known vulnerabilities",
+                    "description": (
+                        f"{pkg_name} has {len(vulns)} known CVEs: {cve_list}. "
+                        f"{'Includes: ' + '; '.join(summaries[:2]) if summaries else ''}"
+                    ),
+                    "file_path": None,
+                    "rule_id": f"osv_{pkg_name}",
+                }
+            )
 
     if result.returncode != 0 and stderr_str:
         logger.info(

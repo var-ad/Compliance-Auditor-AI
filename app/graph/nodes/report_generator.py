@@ -10,7 +10,7 @@ from app.utils.llm import groq_retry
 logger = logging.getLogger(__name__)
 
 FRAMEWORKS = ("soc2", "iso27001", "gdpr", "dpdp")
-SEVERITIES = ("critical", "high", "medium", "low")
+SEVERITIES = ("critical", "high", "medium", "low", "info")
 
 FRAMEWORK_WEIGHTS = {
     "soc2": 0.35,
@@ -20,10 +20,11 @@ FRAMEWORK_WEIGHTS = {
 }
 
 SEVERITY_WEIGHTS = {
-    "critical": -25,
-    "high": -15,
-    "medium": -7,
-    "low": -3,
+    "critical": -20,
+    "high": -10,
+    "medium": -3,
+    "low": -1,
+    "info": 0,
 }
 
 
@@ -62,8 +63,14 @@ async def run_report_generator(state: AuditState) -> dict:
             f"- GDPR: {grouped_controls['gdpr']['controls_triggered']} controls triggered\n"
             f"- DPDP: {grouped_controls['dpdp']['controls_triggered']} controls triggered\n"
             f"Total findings: {total_findings}\n"
+            f"Severity breakdown: {severity_breakdown['critical']} critical, "
+            f"{severity_breakdown['high']} high, "
+            f"{severity_breakdown['medium']} medium, "
+            f"{severity_breakdown['low']} low, "
+            f"{severity_breakdown.get('info', 0)} info.\n"
             "Write a 3-sentence executive summary for a technical audience.\n"
-            "Be specific, professional, and actionable."
+            "Base the summary on the actual data provided — do not invent findings "
+            "or severities that are not listed above. Be specific, professional, and actionable."
         )
         response = await groq_retry(
             lambda: client.chat.completions.create(

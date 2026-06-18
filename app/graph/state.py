@@ -4,11 +4,12 @@ from typing import Annotated, Literal, TypedDict
 
 class Finding(TypedDict):
     tool: str
-    severity: Literal["critical", "high", "medium", "low"]
+    severity: Literal["critical", "high", "medium", "low", "info"]
     title: str
     description: str
     file_path: str | None
     rule_id: str | None
+    finding_type: str | None  # pre-classified type (e.g. by CVE LLM classifier)
 
 
 class MappedControl(TypedDict):
