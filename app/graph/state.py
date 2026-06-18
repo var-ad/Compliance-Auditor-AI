@@ -1,10 +1,10 @@
 import operator
-from typing import Annotated, TypedDict
+from typing import Annotated, Literal, TypedDict
 
 
 class Finding(TypedDict):
     tool: str
-    severity: str
+    severity: Literal["critical", "high", "medium", "low"]
     title: str
     description: str
     file_path: str | None
@@ -21,6 +21,7 @@ class MappedControl(TypedDict):
 
 class AuditState(TypedDict):
     repo_url: str
+    local_path: str | None
     semgrep_findings: Annotated[list[Finding], operator.add]
     osv_findings: Annotated[list[Finding], operator.add]
     github_findings: Annotated[list[Finding], operator.add]

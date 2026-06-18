@@ -1,25 +1,57 @@
 import json
-import os
+import logging
 
-from dotenv import load_dotenv
 from groq import AsyncGroq
 
 from app.graph.state import AuditState, MappedControl
+from app.utils.config import GROQ_API_KEY, LLM_MODEL
+from app.utils.llm import groq_retry
+
+logger = logging.getLogger(__name__)
 
 FRAMEWORKS = ("soc2", "iso27001", "gdpr", "dpdp")
 SEVERITIES = ("critical", "high", "medium", "low")
+
+FRAMEWORK_WEIGHTS = {
+    "soc2": 0.35,
+    "iso27001": 0.25,
+    "gdpr": 0.25,
+    "dpdp": 0.15,
+}
+
+SEVERITY_WEIGHTS = {
+    "critical": -25,
+    "high": -15,
+    "medium": -7,
+    "low": -3,
+}
 
 
 async def run_report_generator(state: AuditState) -> dict:
     try:
         mapped_controls = state.get("mapped_controls", [])
+        state_error = state.get("error")
+
+        # If there's an upstream error and no mapped controls, include it in report
+        if state_error and not mapped_controls:
+            report_dict = {
+                "repo_url": state["repo_url"],
+                "overall_score": 0,
+                "executive_summary": "Audit could not be completed due to errors.",
+                "frameworks": _empty_frameworks(),
+                "framework_scores": {fw: 0 for fw in FRAMEWORKS},
+                "severity_breakdown": {s: 0 for s in SEVERITIES},
+                "error": state_error,
+            }
+            return {"report": json.dumps(report_dict)}
+
         grouped_controls = _group_by_framework(mapped_controls)
         severity_breakdown = _severity_breakdown(mapped_controls)
         total_findings = sum(severity_breakdown.values())
-        overall_score = _overall_score(severity_breakdown)
+        framework_scores = _per_framework_scores(mapped_controls)
+        overall_score = _weighted_score(framework_scores)
 
-        load_dotenv()
-        client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
+        client = AsyncGroq(api_key=GROQ_API_KEY)
         prompt = (
             "You are a compliance auditor writing an executive summary.\n"
             f"Repository: {state['repo_url']}\n"
@@ -33,9 +65,11 @@ async def run_report_generator(state: AuditState) -> dict:
             "Write a 3-sentence executive summary for a technical audience.\n"
             "Be specific, professional, and actionable."
         )
-        response = await client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
+        response = await groq_retry(
+            lambda: client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+            )
         )
         executive_summary = response.choices[0].message.content or ""
 
@@ -44,18 +78,33 @@ async def run_report_generator(state: AuditState) -> dict:
             "overall_score": overall_score,
             "executive_summary": executive_summary,
             "frameworks": grouped_controls,
+            "framework_scores": framework_scores,
             "severity_breakdown": severity_breakdown,
         }
+        if state_error:
+            report_dict["error"] = state_error
+
+        logger.info(
+            "Report generated: score=%d, %d controls mapped, framework_scores=%s",
+            overall_score,
+            len(mapped_controls),
+            framework_scores,
+        )
         return {"report": json.dumps(report_dict)}
     except Exception as exc:
+        logger.error("Report generation failed: %s", exc)
         return {"report": "", "error": str(exc)}
 
 
-def _group_by_framework(mapped_controls: list[MappedControl]) -> dict:
-    grouped = {
+def _empty_frameworks() -> dict:
+    return {
         framework: {"controls_triggered": 0, "findings": []}
         for framework in FRAMEWORKS
     }
+
+
+def _group_by_framework(mapped_controls: list[MappedControl]) -> dict:
+    grouped = _empty_frameworks()
     control_ids = {framework: set() for framework in FRAMEWORKS}
 
     for mapped_control in mapped_controls:
@@ -93,10 +142,47 @@ def _severity_breakdown(mapped_controls: list[MappedControl]) -> dict:
     return breakdown
 
 
-def _overall_score(severity_breakdown: dict) -> int:
-    score = 100
-    score -= 20 * severity_breakdown["critical"]
-    score -= 10 * severity_breakdown["high"]
-    score -= 5 * severity_breakdown["medium"]
-    score -= 2 * severity_breakdown["low"]
-    return max(score, 0)
+def _per_framework_scores(mapped_controls: list[MappedControl]) -> dict[str, int]:
+    """Compute a compliance score per framework, independently deduplicated."""
+    per_fw_breakdown: dict[str, dict[str, int]] = {
+        fw: {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        for fw in FRAMEWORKS
+    }
+    # Per-framework seen set so the same finding counts toward each framework
+    fw_seen: dict[str, set[tuple[str, str, str]]] = {
+        fw: set() for fw in FRAMEWORKS
+    }
+
+    for mc in mapped_controls:
+        framework = mc.get("framework", "")
+        if framework not in per_fw_breakdown:
+            continue
+        finding = mc["finding"]
+        key = (
+            finding.get("tool", ""),
+            finding.get("rule_id") or finding.get("title", ""),
+            finding.get("description", ""),
+        )
+        if key in fw_seen[framework]:
+            continue
+        fw_seen[framework].add(key)
+        severity = finding.get("severity", "").lower()
+        if severity in per_fw_breakdown[framework]:
+            per_fw_breakdown[framework][severity] += 1
+
+    scores = {}
+    for framework, breakdown in per_fw_breakdown.items():
+        deduction = sum(
+            SEVERITY_WEIGHTS[sev] * count for sev, count in breakdown.items()
+        )
+        scores[framework] = max(0, 100 + deduction)
+
+    return scores
+
+
+def _weighted_score(framework_scores: dict[str, int]) -> int:
+    """Compute overall score as weighted average of per-framework scores."""
+    weighted = sum(
+        FRAMEWORK_WEIGHTS[fw] * framework_scores.get(fw, 0) for fw in FRAMEWORKS
+    )
+    return round(weighted)

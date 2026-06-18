@@ -1,66 +1,79 @@
 import asyncio
 import json
+import logging
 import shutil
-import tempfile
+import subprocess
 
 from app.graph.state import AuditState, Finding
 
+logger = logging.getLogger(__name__)
+
+
+def _run_osv_sync(repo_path: str) -> list[Finding]:
+    """Run osv-scanner synchronously in a thread."""
+    osv_path = shutil.which("osv-scanner")
+    if not osv_path:
+        raise RuntimeError("osv-scanner is not installed or not on PATH")
+
+    result = subprocess.run(
+        [osv_path, "--format", "json", repo_path],
+        capture_output=True,
+        timeout=300,
+    )
+
+    stdout_str = (result.stdout.decode(errors="replace") if result.stdout else "").strip()
+    stderr_str = (result.stderr.decode(errors="replace") if result.stderr else "").strip()
+
+    # osv-scanner exits non-zero when it finds vulnerabilities.
+    # If we got JSON on stdout, proceed — it found stuff.
+    if not stdout_str:
+        raise RuntimeError(
+            stderr_str or f"osv-scanner exited with code {result.returncode} (no output)"
+        )
+
+    data = json.loads(stdout_str)
+    findings: list[Finding] = []
+    for scan_result in data.get("results", []):
+        for package in scan_result.get("packages", []):
+            for vuln in package.get("vulnerabilities", []):
+                vuln_id = vuln["id"]
+                findings.append(
+                    {
+                        "tool": "osv",
+                        "severity": _severity(vuln),
+                        "title": vuln_id,
+                        "description": vuln.get("summary", vuln_id),
+                        "file_path": None,
+                        "rule_id": vuln_id,
+                    }
+                )
+
+    if result.returncode != 0 and stderr_str:
+        logger.info(
+            "osv-scanner exited %d with stderr (expected): %s",
+            result.returncode,
+            stderr_str[:200],
+        )
+
+    return findings
+
 
 async def run_osv(state: AuditState) -> dict:
-    temp_dir = tempfile.mkdtemp()
+    if state.get("error"):
+        return {}
+
+    repo_path = state.get("local_path")
+    if not repo_path:
+        return {"osv_findings": [], "error": "No local_path in state"}
+
     try:
-        await _clone_repo(state["repo_url"], temp_dir)
-        process = await asyncio.create_subprocess_exec(
-            "osv-scanner",
-            "--format",
-            "json",
-            temp_dir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await process.communicate()
-
-        if not stdout:
-            raise RuntimeError(stderr.decode(errors="replace") or "osv-scanner produced no JSON output")
-
-        data = json.loads(stdout.decode())
-        findings: list[Finding] = []
-        for result in data.get("results", []):
-            for package in result.get("packages", []):
-                for vuln in package.get("vulnerabilities", []):
-                    vuln_id = vuln["id"]
-                    findings.append(
-                        {
-                            "tool": "osv",
-                            "severity": _severity(vuln),
-                            "title": vuln_id,
-                            "description": vuln.get("summary", vuln_id),
-                            "file_path": None,
-                            "rule_id": vuln_id,
-                        }
-                    )
-
+        findings = await asyncio.to_thread(_run_osv_sync, repo_path)
+        logger.info("OSV found %d findings", len(findings))
         return {"osv_findings": findings}
     except Exception as exc:
-        return {"osv_findings": [], "error": str(exc)}
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-async def _clone_repo(repo_url: str, destination: str) -> None:
-    process = await asyncio.create_subprocess_exec(
-        "git",
-        "clone",
-        "--depth",
-        "1",
-        repo_url,
-        destination,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await process.communicate()
-    if process.returncode != 0:
-        raise RuntimeError(stderr.decode(errors="replace"))
+        err_text = str(exc) or "Unknown error"
+        logger.error("OSV scan failed: %s", err_text)
+        return {"osv_findings": [], "error": err_text}
 
 
 def _severity(vuln: dict) -> str:

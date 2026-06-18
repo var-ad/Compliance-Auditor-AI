@@ -1,62 +1,103 @@
 import asyncio
 import json
+import logging
 import shutil
-import tempfile
+import subprocess
 
 from app.graph.state import AuditState, Finding
 
+logger = logging.getLogger(__name__)
 
-async def run_semgrep(state: AuditState) -> dict:
-    temp_dir = tempfile.mkdtemp()
-    try:
-        await _clone_repo(state["repo_url"], temp_dir)
-        process = await asyncio.create_subprocess_exec(
-            "semgrep",
+# Semgrep severity levels differ from our 4-tier system.
+# https://semgrep.dev/docs/writing-rules/rule-syntax/#severity
+SEMGREP_SEVERITY_MAP = {
+    "error": "critical",
+    "warning": "high",
+    "inventory": "low",
+    "info": "low",
+}
+
+
+def _map_severity(semgrep_severity: str) -> str:
+    """Map semgrep severity to our 4-tier system (critical/high/medium/low)."""
+    mapped = SEMGREP_SEVERITY_MAP.get(semgrep_severity.lower())
+    if mapped:
+        return mapped
+    # Fallback: treat anything unrecognized as medium
+    return "medium"
+
+
+def _run_semgrep_sync(repo_path: str) -> list[Finding]:
+    """Run semgrep synchronously in a thread."""
+    semgrep_path = shutil.which("semgrep")
+    if not semgrep_path:
+        raise RuntimeError("semgrep is not installed or not on PATH")
+
+    result = subprocess.run(
+        [
+            semgrep_path,
             "--config",
             "auto",
             "--json",
-            temp_dir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            "--no-force-color",
+            "--exclude",
+            ".venv",
+            "--exclude",
+            "node_modules",
+            "--exclude",
+            "vendor",
+            "--exclude",
+            "dist",
+            "--exclude",
+            "build",
+            repo_path,
+        ],
+        capture_output=True,
+        timeout=300,
+    )
+
+    out = result.stdout.decode(errors="replace") if result.stdout else ""
+    err = result.stderr.decode(errors="replace") if result.stderr else ""
+
+    # semgrep exits non-zero when it finds issues.
+    # Only treat as real error if stdout is empty.
+    if result.returncode != 0 and not out:
+        raise RuntimeError(
+            err.strip() or out.strip() or f"semgrep exited with code {result.returncode}"
         )
-        stdout, stderr = await process.communicate()
 
-        if process.returncode != 0 and not stdout:
-            raise RuntimeError(stderr.decode(errors="replace"))
+    data = json.loads(out or "{}")
+    findings: list[Finding] = []
+    for sem_result in data.get("results", []):
+        extra = sem_result.get("extra", {})
+        raw_severity = extra.get("severity", "warning")
+        findings.append(
+            {
+                "tool": "semgrep",
+                "severity": _map_severity(raw_severity),
+                "title": sem_result["check_id"],
+                "description": extra.get("message", ""),
+                "file_path": sem_result.get("path"),
+                "rule_id": sem_result["check_id"],
+            }
+        )
 
-        data = json.loads(stdout.decode() or "{}")
-        findings: list[Finding] = []
-        for result in data.get("results", []):
-            extra = result.get("extra", {})
-            findings.append(
-                {
-                    "tool": "semgrep",
-                    "severity": extra.get("severity", "medium").lower(),
-                    "title": result["check_id"],
-                    "description": extra.get("message", ""),
-                    "file_path": result.get("path"),
-                    "rule_id": result["check_id"],
-                }
-            )
+    return findings
 
+
+async def run_semgrep(state: AuditState) -> dict:
+    if state.get("error"):
+        return {}
+
+    repo_path = state.get("local_path")
+    if not repo_path:
+        return {"semgrep_findings": [], "error": "No local_path in state"}
+
+    try:
+        findings = await asyncio.to_thread(_run_semgrep_sync, repo_path)
+        logger.info("Semgrep found %d findings", len(findings))
         return {"semgrep_findings": findings}
     except Exception as exc:
-        return {"semgrep_findings": [], "error": str(exc)}
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-async def _clone_repo(repo_url: str, destination: str) -> None:
-    process = await asyncio.create_subprocess_exec(
-        "git",
-        "clone",
-        "--depth",
-        "1",
-        repo_url,
-        destination,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await process.communicate()
-    if process.returncode != 0:
-        raise RuntimeError(stderr.decode(errors="replace"))
+        err_text = str(exc) or "Unknown error"
+        logger.error("Semgrep scan failed: %s", err_text)
+        return {"semgrep_findings": [], "error": err_text}

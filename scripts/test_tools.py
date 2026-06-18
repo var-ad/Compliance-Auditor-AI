@@ -1,9 +1,10 @@
 import asyncio
-import os
 import subprocess
 
 import httpx
-from dotenv import load_dotenv
+
+# Import config so load_dotenv() runs via central module
+import app.utils.config  # noqa: F401
 
 
 def test_semgrep() -> bool:
@@ -35,13 +36,14 @@ def test_osv_scanner() -> bool:
 
 
 async def test_github_api() -> bool:
-    token = os.getenv("GITHUB_TOKEN")
+    from app.utils.config import GITHUB_TOKEN
+
     headers = {
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
 
     async with httpx.AsyncClient(timeout=15) as client:
         response = await client.get("https://api.github.com/rate_limit", headers=headers)
@@ -49,7 +51,6 @@ async def test_github_api() -> bool:
 
 
 async def main() -> None:
-    load_dotenv()
     checks = {
         "semgrep": test_semgrep(),
         "osv-scanner": test_osv_scanner(),

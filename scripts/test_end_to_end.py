@@ -1,24 +1,28 @@
 import asyncio
 import json
+import os
 import shutil
 import sys
-from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+CI = os.environ.get("CI", "").lower() in ("1", "true", "yes")
+
+REQUIRED_TOOLS = ("git", "semgrep", "osv-scanner")
 
 
 def missing_tools() -> list[str]:
-    required_tools = ("git", "semgrep", "osv-scanner")
-    return [tool for tool in required_tools if shutil.which(tool) is None]
+    return [tool for tool in REQUIRED_TOOLS if shutil.which(tool) is None]
 
 
 async def main() -> None:
     missing = missing_tools()
     if missing:
-        print(f"Missing required CLI tools: {', '.join(missing)}")
-        print("Install them and make sure they are available on PATH, then rerun this script.")
+        msg = (
+            f"Missing required CLI tools: {', '.join(missing)}. "
+            "Install them and ensure they are on PATH."
+        )
+        print(msg)
+        if CI:
+            sys.exit(1)
         return
 
     from app.graph.graph import compliance_graph

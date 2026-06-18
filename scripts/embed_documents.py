@@ -1,18 +1,35 @@
 import asyncio
 import io
+import logging
 import os
 import re
+import sys
+from functools import lru_cache
 
 import fitz
 import httpx
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 from supabase import create_client
 
+# Ensure project root is on sys.path when running as a script
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
+# Import config so load_dotenv() runs via central module
+from app.utils.config import SUPABASE_KEY, SUPABASE_URL
+
+logger = logging.getLogger(__name__)
+
 GDPR_URL = "https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:32016R0679"
 DPDP_URL = "https://www.dpdpa.com/DPDP_Rules_2025_English_only.pdf"
-MODEL = SentenceTransformer("BAAI/bge-base-en-v1.5")
+
+
+@lru_cache(maxsize=1)
+def _get_model() -> SentenceTransformer:
+    """Lazy-loaded model — 200MB loaded only when first needed."""
+    return SentenceTransformer("BAAI/bge-base-en-v1.5")
 
 
 async def fetch_bytes(url: str) -> bytes:
@@ -99,7 +116,7 @@ async def extract_dpdp_rules(pdf_bytes: bytes) -> list[dict]:
 
 
 def get_embedding(text: str) -> list[float]:
-    return MODEL.encode(text).tolist()
+    return _get_model().encode(text).tolist()
 
 
 async def embed_text(text: str) -> list[float]:
@@ -126,24 +143,26 @@ async def embed_chunks(supabase, chunks: list[dict]) -> None:
 
         metadata = chunk["metadata"]
         if chunk["framework"] == "gdpr":
-            print(f"Embedded GDPR article {metadata['article']}")
+            logger.info("Embedded GDPR article %s", metadata["article"])
         else:
-            print(f"Embedded DPDP rule {metadata['rule']}")
+            logger.info("Embedded DPDP rule %s", metadata["rule"])
 
         await asyncio.sleep(0.5)
 
 
 async def main() -> None:
-    load_dotenv()
-    supabase_url = os.getenv("SUPABASE_URL")
-    supabase_key = os.getenv("SUPABASE_KEY")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("SUPABASE_URL and SUPABASE_KEY are required (set in .env)")
 
-    if not supabase_url or not supabase_key:
-        raise RuntimeError("SUPABASE_URL and SUPABASE_KEY are required")
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-    supabase = create_client(supabase_url, supabase_key)
-
-    gdpr_html, dpdp_pdf = await asyncio.gather(fetch_bytes(GDPR_URL), fetch_bytes(DPDP_URL))
+    gdpr_html, dpdp_pdf = await asyncio.gather(
+        fetch_bytes(GDPR_URL), fetch_bytes(DPDP_URL)
+    )
     gdpr_chunks = await extract_gdpr_articles(gdpr_html)
     dpdp_chunks = await extract_dpdp_rules(dpdp_pdf)
 

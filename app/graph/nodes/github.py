@@ -1,27 +1,29 @@
-import os
-import re
-from urllib.parse import urlparse
+import logging
 
 import httpx
-from dotenv import load_dotenv
 
 from app.graph.state import AuditState, Finding
+from app.utils.config import GITHUB_TOKEN
+from app.utils.git import parse_github_url
+
+logger = logging.getLogger(__name__)
 
 
 async def run_github(state: AuditState) -> dict:
+    if state.get("error"):
+        return {}
+
     try:
-        load_dotenv()
-        owner, repo = _parse_repo(state["repo_url"])
+        owner, repo = parse_github_url(state["repo_url"])
         if not owner or not repo:
             raise ValueError("Invalid GitHub repo URL")
 
-        token = os.getenv("GITHUB_TOKEN")
         headers = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         }
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+        if GITHUB_TOKEN:
+            headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
 
         findings: list[Finding] = []
         async with httpx.AsyncClient(
@@ -42,7 +44,9 @@ async def run_github(state: AuditState) -> dict:
                         )
                     )
 
-            branch_response = await client.get(f"/repos/{owner}/{repo}/branches/main/protection")
+            branch_response = await client.get(
+                f"/repos/{owner}/{repo}/branches/main/protection"
+            )
             if branch_response.status_code == 404:
                 findings.append(
                     _finding(
@@ -77,23 +81,11 @@ async def run_github(state: AuditState) -> dict:
                     )
                 )
 
+        logger.info("GitHub API found %d findings", len(findings))
         return {"github_findings": findings}
     except Exception as exc:
+        logger.error("GitHub scan failed: %s", exc)
         return {"github_findings": [], "error": str(exc)}
-
-
-def _parse_repo(repo_url: str) -> tuple[str | None, str | None]:
-    ssh_match = re.match(r"^git@github\.com:(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?$", repo_url)
-    if ssh_match:
-        return ssh_match.group("owner"), ssh_match.group("repo")
-
-    parsed = urlparse(repo_url)
-    if parsed.scheme not in {"http", "https"} or parsed.netloc != "github.com":
-        return None, None
-    parts = [part for part in parsed.path.strip("/").removesuffix(".git").split("/") if part]
-    if len(parts) != 2:
-        return None, None
-    return parts[0], parts[1]
 
 
 def _finding(severity: str, title: str, description: str, rule_id: str) -> Finding:
