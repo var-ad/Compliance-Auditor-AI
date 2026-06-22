@@ -54,23 +54,28 @@ async def run_report_generator(state: AuditState) -> dict:
 
         client = AsyncGroq(api_key=GROQ_API_KEY)
         prompt = (
-            "You are a compliance auditor writing an executive summary.\n"
+            "You are a compliance auditor writing an executive summary. "
+            "Use ONLY the numbers provided below — do not invent or round them.\n\n"
             f"Repository: {state['repo_url']}\n"
             f"Overall compliance score: {overall_score}/100\n"
-            "Findings summary:\n"
-            f"- SOC 2: {grouped_controls['soc2']['controls_triggered']} controls triggered\n"
-            f"- ISO 27001: {grouped_controls['iso27001']['controls_triggered']} controls triggered\n"
-            f"- GDPR: {grouped_controls['gdpr']['controls_triggered']} controls triggered\n"
-            f"- DPDP: {grouped_controls['dpdp']['controls_triggered']} controls triggered\n"
-            f"Total findings: {total_findings}\n"
+            f"Per-framework scores: SOC2={framework_scores['soc2']}, "
+            f"ISO27001={framework_scores['iso27001']}, "
+            f"GDPR={framework_scores['gdpr']}, DPDP={framework_scores['dpdp']}\n"
+            f"Controls triggered: SOC2={grouped_controls['soc2']['controls_triggered']}, "
+            f"ISO27001={grouped_controls['iso27001']['controls_triggered']}, "
+            f"GDPR={grouped_controls['gdpr']['controls_triggered']}, "
+            f"DPDP={grouped_controls['dpdp']['controls_triggered']}\n"
+            f"Total unique findings: {total_findings}\n"
             f"Severity breakdown: {severity_breakdown['critical']} critical, "
             f"{severity_breakdown['high']} high, "
             f"{severity_breakdown['medium']} medium, "
             f"{severity_breakdown['low']} low, "
             f"{severity_breakdown.get('info', 0)} info.\n"
-            "Write a 3-sentence executive summary for a technical audience.\n"
-            "Base the summary on the actual data provided — do not invent findings "
-            "or severities that are not listed above. Be specific, professional, and actionable."
+            "Write exactly 3 sentences. First sentence: overall score and key "
+            "risk areas. Second sentence: most severe findings and their impact. "
+            "Third sentence: recommended next steps.\n"
+            "CRITICAL: All totals, counts, and scores in your response MUST match "
+            "the numbers above exactly. Do not aggregate, extrapolate, or invent any number."
         )
         response = await groq_retry(
             lambda: client.chat.completions.create(

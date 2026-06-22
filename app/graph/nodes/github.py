@@ -4,27 +4,20 @@ import httpx
 
 from app.graph.state import AuditState, Finding
 from app.utils.config import GITHUB_TOKEN
-from app.utils.git import parse_github_url
+from app.utils.git import SOURCE_GITHUB, parse_git_url
 
 logger = logging.getLogger(__name__)
 
 
-async def _has_security_policy(client: httpx.AsyncClient, owner: str, repo: str) -> str | None:
+async def _has_security_policy(client: httpx.AsyncClient, owner: str, repo: str, host: str = "github.com") -> str | None:
     """Check if the repo has a security policy. Returns a URL or None."""
-    # Try SECURITY.md in the repo root
-    try:
-        resp = await client.get(f"/repos/{owner}/{repo}/contents/SECURITY.md")
-        if resp.status_code == 200:
-            return f"https://github.com/{owner}/{repo}/blob/master/SECURITY.md"
-    except Exception:
-        pass
-    # Try the community health repo (.github)
-    try:
-        resp = await client.get(f"/repos/{owner}/.github/contents/SECURITY.md")
-        if resp.status_code == 200:
-            return f"https://github.com/{owner}/.github/blob/master/SECURITY.md"
-    except Exception:
-        pass
+    for attempt_owner in (owner, ".github"):
+        try:
+            resp = await client.get(f"/repos/{attempt_owner}/{repo}/contents/SECURITY.md")
+            if resp.status_code == 200:
+                return f"https://{host}/{attempt_owner}/{repo}/blob/master/SECURITY.md"
+        except Exception:
+            pass
     return None
 
 
@@ -32,8 +25,13 @@ async def run_github(state: AuditState) -> dict:
     if state.get("error"):
         return {}
 
+    # Only run for GitHub-hosted repos
+    if state.get("input_source") != SOURCE_GITHUB:
+        logger.info("GitHub checks: skipping (source=%s)", state.get("input_source"))
+        return {"github_findings": []}
+
     try:
-        owner, repo = parse_github_url(state["repo_url"])
+        owner, repo, _ = parse_git_url(state["repo_url"])
         if not owner or not repo:
             raise ValueError("Invalid GitHub repo URL")
 
@@ -166,7 +164,7 @@ async def run_github(state: AuditState) -> dict:
         return {"github_findings": findings}
     except Exception as exc:
         logger.error("GitHub scan failed: %s", exc)
-        return {"github_findings": [], "error": str(exc)}
+        return {"github_findings": []}
 
 
 def _finding(severity: str, title: str, description: str, rule_id: str) -> Finding:

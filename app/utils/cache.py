@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from app.utils.config import GITHUB_TOKEN, SUPABASE_KEY, SUPABASE_URL
-from app.utils.git import parse_github_url
+from app.utils.git import SOURCE_GITHUB, detect_source_type, parse_git_url
 
 logger = logging.getLogger(__name__)
 
@@ -15,32 +15,35 @@ FALLBACK_PREFIX = "fb_"
 
 
 async def get_cache_key(repo_url: str) -> str:
-    """Generate a cache key based on the latest commit SHA of the repo."""
-    try:
-        owner, repo = parse_github_url(repo_url)
-        if not owner or not repo:
-            return FALLBACK_PREFIX + _fallback_key(repo_url)
+    """Generate a cache key based on commit SHA (GitHub) or URL hash (others)."""
+    source_type = detect_source_type(repo_url)
 
-        headers = {
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
-        if GITHUB_TOKEN:
-            headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    # GitHub: use latest commit SHA for cache-busting
+    if source_type == SOURCE_GITHUB:
+        try:
+            owner, repo, _ = parse_git_url(repo_url)
+            if owner and repo:
+                headers = {
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                }
+                if GITHUB_TOKEN:
+                    headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
 
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.get(
-                f"https://api.github.com/repos/{owner}/{repo}/commits/HEAD",
-                headers=headers,
-            )
-            if response.status_code == 200:
-                sha = response.json().get("sha", "")
-                if sha:
-                    return f"{owner}_{repo}_{sha}"
+                async with httpx.AsyncClient(timeout=15) as client:
+                    response = await client.get(
+                        f"https://api.github.com/repos/{owner}/{repo}/commits/HEAD",
+                        headers=headers,
+                    )
+                    if response.status_code == 200:
+                        sha = response.json().get("sha", "")
+                        if sha:
+                            return f"{owner}_{repo}_{sha}"
+        except Exception:
+            pass
 
-        return FALLBACK_PREFIX + _fallback_key(repo_url)
-    except Exception:
-        return FALLBACK_PREFIX + _fallback_key(repo_url)
+    # Fallback: hash the URL/path for non-GitHub sources
+    return FALLBACK_PREFIX + _fallback_key(repo_url)
 
 
 def _fallback_key(repo_url: str) -> str:

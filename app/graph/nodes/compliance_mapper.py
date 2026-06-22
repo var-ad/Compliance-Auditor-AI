@@ -5,7 +5,10 @@ from app.graph.state import AuditState, Finding, MappedControl
 SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 from app.mapper.controls import (
     GDPR_DPDP_EXCLUDED_TYPES,
+    REMEDIATION_MAP,
+    _batch_classify_cves,
     _classify_cve,
+    _classify_finding_type,
     batch_map_findings_soc2_iso,
     get_controls,
 )
@@ -356,6 +359,7 @@ def _curated_gdpr_dpdp(findings: list[Finding]) -> list[MappedControl]:
 async def _preclassify_cve_findings(findings: list[Finding]) -> None:
     """Run LLM classifier on OSV findings to determine CVE subtype.
 
+    Uses a single batched API call for all CVEs instead of one call per CVE.
     Sets finding["finding_type"] on each OSV finding in-place.
     Failures fall back to heuristic classification in controls.py.
     """
@@ -363,17 +367,40 @@ async def _preclassify_cve_findings(findings: list[Finding]) -> None:
     if not osv_findings:
         return
 
+    # Collect descriptions for batch classification
+    items: list[tuple[str, str]] = []
+    for f in osv_findings:
+        desc = f.get("description", "")
+        rid = str(f.get("rule_id", ""))
+        if desc and rid:
+            items.append((desc, rid))
+
+    if not items:
+        return
+
     client = AsyncGroq(api_key=GROQ_API_KEY)
-    for finding in osv_findings:
-        description = finding.get("description", "")
-        if not description:
-            continue
-        try:
-            result = await _classify_cve(description, client)
-            finding["finding_type"] = result
-            logger.info("CVE: %s -> %s", finding.get("rule_id"), result)
-        except Exception as exc:
-            logger.info("CVE: %s failed (%s), using heuristic", finding.get("rule_id"), exc)
+    try:
+        results = await _batch_classify_cves(items, client)
+        for finding in osv_findings:
+            rid = str(finding.get("rule_id", ""))
+            ftype = results.get(rid, "")
+            if ftype:
+                finding["finding_type"] = ftype
+                logger.info("CVE: %s -> %s", rid, ftype)
+    except Exception as exc:
+        logger.info("Batch CVE classify failed (%s), falling back to per-CVE", exc)
+        # Fallback: individual calls
+        for finding in osv_findings:
+            description = finding.get("description", "")
+            if not description:
+                continue
+            try:
+                result = await _classify_cve(description, client)
+                finding["finding_type"] = result
+                logger.info("CVE: %s -> %s", finding.get("rule_id"), result)
+            except Exception as exc2:
+                logger.info("CVE: %s failed (%s), using heuristic",
+                            finding.get("rule_id"), exc2)
 
 
 async def run_compliance_mapper(state: AuditState) -> dict:
@@ -381,38 +408,77 @@ async def run_compliance_mapper(state: AuditState) -> dict:
         return {}
 
     try:
-        findings = [
-            *state.get("semgrep_findings", []),
-            *state.get("osv_findings", []),
-            *state.get("github_findings", []),
+        # Collect and validate all findings from scanner nodes
+        raw_findings = []
+        findings_sources = [
+            ("semgrep", *state.get("semgrep_findings", [])),
+            ("osv", *state.get("osv_findings", [])),
+            ("github", *state.get("github_findings", [])),
+            ("secrets", *state.get("secrets_findings", [])),
+            ("governance", *state.get("governance_findings", [])),
+            ("sbom", *state.get("sbom_findings", [])),
+            ("iac", *state.get("iac_findings", [])),
+            ("cicd", *state.get("cicd_findings", [])),
+            ("data_class", *state.get("data_classification_findings", [])),
         ]
-        deduplicated_findings = await _deduplicate_by_rule_id(findings)
+        for source, *items in findings_sources:
+            for item in items:
+                if not isinstance(item, dict):
+                    logger.warning("Mapper: %s finding is not a dict: %s (type=%s)",
+                                   source, item, type(item).__name__)
+                    continue
+                raw_findings.append(item)
+
+        # Strip local temp path prefix from all file_path values
+        local_path = state.get("local_path") or ""
+        _strip_path_prefix(raw_findings, local_path)
+
+        deduplicated_findings = await _deduplicate_by_rule_id(raw_findings)
 
         # Step 0: Pre-classify CVE findings using LLM (sets finding_type hint)
         await _preclassify_cve_findings(deduplicated_findings)
+        logger.info("Step 0 done: %d deduplicated findings", len(deduplicated_findings))
+
+        # Step 0b: Enrich findings with remediation text from REMEDIATION_MAP.
+        # Each finding's remediation is determined by its finding_type (which
+        # the classifier sets). Findings not covered by the map get None.
+        for f in deduplicated_findings:
+            if f.get("remediation"):
+                continue
+            ftype = f.get("finding_type")
+            if not ftype:
+                desc = f.get("description", "")
+                rid = f.get("rule_id", "")
+                ftype = _classify_finding_type(rid, desc, None)
+            if ftype in REMEDIATION_MAP:
+                f["remediation"] = REMEDIATION_MAP[ftype]
 
         # Step 1: SOC2/ISO mapping (uses LLM batch with controls.py)
-        #         get_controls() now receives finding_type hint for CVE subtypes
         soc2_iso_mapped = await batch_map_findings_soc2_iso(deduplicated_findings)
+        logger.info("Step 1 done: %d SOC2/ISO mapped controls", len(soc2_iso_mapped))
 
         # Step 2: Curated GDPR/DPDP mapping (deterministic, always runs)
-        # This is the PRIMARY mapper — no LLM, no RAG, no wrong articles
         gdpr_dpdp_mapped = _curated_gdpr_dpdp(deduplicated_findings)
-        logger.info("Curated mapping produced %d GDPR/DPDP controls", len(gdpr_dpdp_mapped))
-        # Log finding types for debugging
+        logger.info("Step 2 done: %d GDPR/DPDP controls", len(gdpr_dpdp_mapped))
+
+        # Log finding types for debugging.
+        # The raw finding_type field is the scanner-set value (None for Semgrep/GitHub).
+        # The resolved type comes from _classify_finding_type() which runs during mapping.
         for f in deduplicated_findings:
+            if not isinstance(f, dict):
+                continue
             rid = f.get("rule_id", "")
-            ftype = f.get("finding_type", "unset") or "heuristic"
+            raw_type = f.get("finding_type")
+            raw_label = raw_type or "unset"
+            resolved = _classify_finding_type(rid, f.get("description", ""), raw_type)
             has_gdpr = any(
-                m["finding"]["rule_id"] == rid and m["framework"] == "gdpr"
+                isinstance(m, dict) and m.get("finding", {}).get("rule_id") == rid
+                and m.get("framework") == "gdpr"
                 for m in gdpr_dpdp_mapped
             )
-            logger.info(
-                "  %s -> type=%s GDPR=%s", rid, ftype, has_gdpr
-            )
+            logger.info("  %s -> raw=%s resolved=%s GDPR=%s", rid, raw_label, resolved, has_gdpr)
 
-        # Step 3: RAG enrichment — retrieves the ACTUAL regulation text for
-        # the already-selected article/rule and generates a grounded explanation
+        # Step 3: RAG enrichment
         if gdpr_dpdp_mapped:
             try:
                 enriched = await enrich_gdpr_dpdp_explanations(
@@ -420,7 +486,7 @@ async def run_compliance_mapper(state: AuditState) -> dict:
                 )
                 if enriched:
                     gdpr_dpdp_mapped = enriched
-                    logger.info("RAG enriched %d GDPR/DPDP explanations", len(enriched))
+                    logger.info("Step 3: RAG enriched %d explanations", len(enriched))
             except Exception as exc:
                 logger.debug(
                     "RAG enrichment failed, keeping curated explanations: %s", exc
@@ -431,17 +497,45 @@ async def run_compliance_mapper(state: AuditState) -> dict:
             *gdpr_dpdp_mapped,
         ]
 
-        logger.info("Mapped %d controls", len(mapped_controls))
+        logger.info("Mapped %d controls total", len(mapped_controls))
         return {"mapped_controls": mapped_controls}
     except Exception as exc:
         logger.error("Compliance mapping failed: %s", exc)
         return {"mapped_controls": [], "error": str(exc)}
 
 
+def _strip_path_prefix(findings: list[Finding], local_path: str) -> None:
+    """Strip local temp path prefix from all finding file_paths in-place.
+
+    Turns 'C:\\Users\\...\\tmpXXXX\\Dockerfile' into 'Dockerfile'
+    and 'C:\\Users\\...\\tmpXXXX\\src\\db\\prisma.ts' into 'src/db/prisma.ts'.
+    Handles Windows backslashes too.
+    """
+    if not local_path:
+        return
+    # Normalize: strip trailing slash, then prepend as prefix to match
+    prefix = local_path.rstrip("/\\").replace("\\", "/") + "/"
+    for finding in findings:
+        fp = finding.get("file_path")
+        if not fp or not isinstance(fp, str):
+            continue
+        normalized = fp.replace("\\", "/")
+        if normalized.startswith(prefix):
+            finding["file_path"] = normalized[len(prefix):]
+            logger.debug("Stripped path: %s -> %s", fp, finding["file_path"])
+
+
 async def _deduplicate_by_rule_id(findings: list[Finding]) -> list[Finding]:
-    """Deduplicate findings by rule_id, keeping the most severe entry."""
+    """Deduplicate findings by rule_id, keeping the most severe entry.
+
+    Filters out any non-dict items (defensive — catches malformed scanner output).
+    """
     deduplicated: dict[str, Finding] = {}
     for index, finding in enumerate(findings):
+        if not isinstance(finding, dict):
+            logger.warning("Dedup: skipping non-dict finding at index %d: %s (type=%s)",
+                           index, finding, type(finding).__name__)
+            continue
         rule_id = finding.get("rule_id") or f"finding_{index}"
         existing = deduplicated.get(rule_id)
         if existing is None:

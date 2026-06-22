@@ -112,7 +112,7 @@ async def run_osv(state: AuditState) -> dict:
 
     repo_path = state.get("local_path")
     if not repo_path:
-        return {"osv_findings": [], "error": "No local_path in state"}
+        return {"osv_findings": []}
 
     try:
         findings = await asyncio.to_thread(_run_osv_sync, repo_path)
@@ -121,7 +121,7 @@ async def run_osv(state: AuditState) -> dict:
     except Exception as exc:
         err_text = str(exc) or "Unknown error"
         logger.error("OSV scan failed: %s", err_text)
-        return {"osv_findings": [], "error": err_text}
+        return {"osv_findings": []}
 
 
 def _severity(vuln: dict) -> str:

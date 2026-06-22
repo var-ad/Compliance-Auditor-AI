@@ -130,6 +130,29 @@ RAW_CONTROL_MAP: dict[str, list[str]] = {
     "pii_in_source": ["SOC2:CC6.1", "ISO:A.9.4.3", "GDPR:Art. 32", "DPDP:Rule 8"],
     "debug_mode_enabled": ["SOC2:CC7.1", "ISO:A.12.6.1"],
     "verbose_error_exposure": ["SOC2:CC6.6", "ISO:A.14.2.5"],
+    # ------------------------------------------------------------------ #
+    # CI/CD                                                               #
+    # ------------------------------------------------------------------ #
+    "cicd_plaintext_secret":      ["SOC2:CC6.1", "ISO:A.9.4.3", "GDPR:Art. 32", "DPDP:Rule 8"],
+    "missing_sast_gate":          ["SOC2:CC8.1", "ISO:A.8.25", "ISO:A.8.28"],
+    "unsigned_artifact_publish":  ["SOC2:CC8.1", "ISO:A.8.25"],
+    # ------------------------------------------------------------------ #
+    # DATA CLASSIFICATION                                                 #
+    # ------------------------------------------------------------------ #
+    "pii_field_unencrypted":              ["SOC2:CC6.7", "ISO:A.10.1.1", "GDPR:Art. 32", "DPDP:Rule 8"],
+    "sensitive_category_data_detected":   ["SOC2:CC6.7", "ISO:A.10.1.1", "GDPR:Art. 9", "DPDP:Rule 4"],
+    # ------------------------------------------------------------------ #
+    # IaC / CONFIG                                                        #
+    # ------------------------------------------------------------------ #
+    "iac_storage_misconfigured":  ["SOC2:CC6.1", "ISO:A.8.2.1", "GDPR:Art. 32", "DPDP:Rule 8"],
+    "iac_network_exposed":        ["SOC2:CC6.6", "ISO:A.13.1.1"],
+    "iac_encryption_missing":     ["SOC2:CC6.7", "ISO:A.10.1.1", "GDPR:Art. 32", "DPDP:Rule 8"],
+    "iac_logging_missing":        ["SOC2:CC7.2", "ISO:A.12.4.1"],
+    # ------------------------------------------------------------------ #
+    # SBOM / LICENSE                                                      #
+    # ------------------------------------------------------------------ #
+    "copyleft_license_risk": ["SOC2:CC9.1", "ISO:A.5.21"],
+    "unmaintained_dependency": ["SOC2:CC9.1", "ISO:A.5.21", "ISO:A.5.23"],
 }
 
 # Control names (SOC2 + ISO27001) — fully enumerated for deterministic mapping
@@ -143,6 +166,7 @@ _CONTROL_NAMES: dict[str, str] = {
     "CC7.2": "System Monitoring",
     "CC7.3": "Incident Response",
     "CC8.1": "Change Management",
+    "CC9.1": "Vendor & Third-Party Risk",
     # ISO 27001
     "A.9.2.3": "Management of Privileged Access Rights",
     "A.9.4.1": "Information Access Restriction",
@@ -158,6 +182,13 @@ _CONTROL_NAMES: dict[str, str] = {
     "A.14.2.2": "System Change Control Procedures",
     "A.14.2.5": "Secure System Engineering Principles",
     "A.16.1.1": "Incident Management",
+    "A.5.21": "ICT Supply Chain Management",
+    "A.5.23": "Use of Cloud Services",
+    "A.8.2.1": "Information Classification",
+    "A.8.25": "Secure Development Lifecycle",
+    "A.8.28": "Secure Coding",
+    "A.13.1.1": "Network Security Controls",
+    "A.13.1.2": "Security of Network Services",
     # GDPR + DPDP
     "gdpr_article_32": "Security of Processing",
     "dpdp_rule_8": "Security Safeguards",
@@ -245,34 +276,103 @@ suggestions, or any other text — only the key.
 
 
 async def _classify_cve(description: str, client) -> str:
-    """Run LLM classifier on a CVE description to determine its subtype."""
+    """Run LLM classifier on a single CVE description (fallback)."""
     if not description or not description.strip():
         return "dependency_cve_dos"
-    from app.utils.llm import groq_retry  # noqa: PLC0415
+    result = await _batch_classify_cves([(description, "single")], client)
+    return result.get("single", "dependency_cve_dos")
+
+
+BATCH_CLASSIFY_PROMPT = """
+You are a security compliance classifier. Classify each CVE below into exactly
+one type. Return a valid JSON array where each item has "id" (the given ID)
+and "type" (one of the valid types below).
+
+Valid types:
+- dependency_cve_dos         -- Pure availability impact. ReDoS, memory exhaustion, crash.
+- dependency_cve_network     -- Routing, HTTP handling, URL parsing, middleware, proxies.
+- dependency_cve_data        -- Directly affects data confidentiality/integrity. Auth
+                               libs, ORM, serialization, file read, session mgmt.
+- dependency_cve_email       -- Email/notification library. nodemailer, sendgrid, etc.
+
+Output ONLY valid JSON, no markdown, no explanation.
+
+CVEs to classify:
+{cve_list}
+"""
+
+
+async def _batch_classify_cves(
+    items: list[tuple[str, str]], client
+) -> dict[str, str]:
+    """Classify multiple CVE descriptions in a single API call.
+
+    Args: list of (description, id_string) tuples.
+    Returns: dict mapping id_string -> finding_type (fallback "dependency_cve_dos").
+    """
+    if not items:
+        return {}
+
+    from app.utils.llm import groq_retry, strip_markdown_fences  # noqa: PLC0415
+
+    valid_types = {
+        "dependency_cve_dos", "dependency_cve_network",
+        "dependency_cve_data", "dependency_cve_email",
+    }
+
+    # Build numbered list for the prompt
+    lines = []
+    id_map: dict[str, str] = {}
+    for i, (desc, id_str) in enumerate(items):
+        label = id_str or f"cve_{i}"
+        id_map[str(i)] = label
+        snippet = (desc or "").strip()[:300]  # truncate to avoid token bloat
+        lines.append(f'{i}. [ID: {label}] {snippet}')
+
+    prompt = BATCH_CLASSIFY_PROMPT.format(cve_list="\n".join(lines))
+
     try:
         resp = await groq_retry(
             lambda: client.chat.completions.create(
                 model=LLM_MODEL,
                 messages=[
-                    {"role": "system", "content": CVE_CLASSIFIER_PROMPT},
-                    {"role": "user", "content": description.strip()},
+                    {"role": "system", "content": prompt},
                 ],
-                max_tokens=16,
+                max_tokens=256,
                 temperature=0.0,
             ),
             max_retries=2,
         )
-        result = (resp.choices[0].message.content or "").strip().lower()
-        # Validate the result is a known type
-        valid_types = {
-            "dependency_cve_dos", "dependency_cve_network",
-            "dependency_cve_data", "dependency_cve_email",
-        }
-        if result in valid_types:
-            return result
-        return "dependency_cve_dos"
+        content = (resp.choices[0].message.content or "").strip()
+        content = strip_markdown_fences(content)
+        data = json.loads(content)
     except Exception:
-        return "dependency_cve_dos"
+        logger.warning("Batch CVE classify failed, falling back to default")
+        return {id_str: "dependency_cve_dos" for _, id_str in items}
+
+    # Parse the JSON array response
+    results: dict[str, str] = {}
+    if isinstance(data, list):
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            eid = str(entry.get("id", ""))
+            etype = str(entry.get("type", "")).lower().strip()
+            if etype in valid_types:
+                results[eid] = etype
+    elif isinstance(data, dict):
+        # Some models return a dict mapping id -> type instead
+        for eid, etype in data.items():
+            etype = str(etype).lower().strip()
+            if etype in valid_types:
+                results[eid] = etype
+
+    # Fill in any missing classifications with defaults
+    for _, id_str in items:
+        if id_str not in results:
+            results[id_str] = "dependency_cve_dos"
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -294,9 +394,9 @@ _CLASSIFICATION_RULES: list[tuple[str, dict]] = [
     ("missing_authn", {"rule_id_exact": "github_mfa"}),
 
     # -- Semgrep: Docker --
-    ("docker_root", {"rule_id_prefix": "dockerfile.security.run-as-root"}),
-    ("docker_secret_exposed", {"rule_id_contains": "dockerfile"}),
-    ("docker_secret_exposed", {"rule_id_contains": "docker-compose"}),
+    ("docker_root", {"rule_id_prefix": "dockerfile.security"}),
+    ("docker_secret_exposed", {"rule_id_contains": "dockerfile.secret"}),
+    ("docker_secret_exposed", {"rule_id_contains": "docker-compose.secret"}),
     ("docker_no_resource_limits", {"rule_id_contains": "resource-limit"}),
     ("docker_privileged_mode", {"rule_id_contains": "privileged"}),
     ("docker_unverified_image", {"rule_id_contains": "unverified-image"}),
@@ -382,14 +482,49 @@ _CLASSIFICATION_RULES: list[tuple[str, dict]] = [
     ("gha_injection", {"rule_id_contains": "script-injection"}),
     ("gha_injection", {"rule_id_contains": "context-injection"}),
 
+    # -- CI/CD security scanner (workflow YAML analysis) --
+    ("cicd_plaintext_secret",     {"rule_id_prefix": "cicd_secret_"}),
+    ("missing_sast_gate",         {"rule_id_prefix": "cicd_missing_sast_"}),
+    ("unsigned_artifact_publish", {"rule_id_prefix": "cicd_unsigned_"}),
+
+    # -- Data classification scanner (rule_ids like "dc_unencrypted_*", "dc_sensitive_*") --
+    ("pii_field_unencrypted",            {"rule_id_prefix": "dc_unencrypted_"}),
+    ("sensitive_category_data_detected", {"rule_id_prefix": "dc_sensitive_"}),
+
     # -- Semgrep: Plaintext HTTP --
     ("plaintext_http", {"rule_id_contains": "no-auth-over-http"}),
     ("plaintext_http", {"rule_id_contains": "plaintext"}),
 
     # -- Semgrep: Sensitive data / logging --
     ("sensitive_data_logged", {"rule_id_contains": "sensitive-data"}),
-    ("sensitive_data_logged", {"rule_id_contains": "pii-in"}),
     ("sensitive_data_logged", {"rule_id_contains": "log-injection"}),
+    ("log_injection", {"rule_id_contains": "unsafe-formatstring"}),
+    ("pii_in_source", {"rule_id_prefix": "pii_"}),  # secrets_pii scanner
+    ("pii_in_source", {"rule_id_contains": "pii-in"}),
+
+    # -- SBOM / license scanner --
+    ("copyleft_license_risk", {"rule_id_prefix": "sbom_copyleft"}),
+    ("unmaintained_dependency", {"rule_id_prefix": "sbom_unmaintained"}),
+
+    # -- IaC / Checkov scanner (rule_ids like "checkov_CKV_AWS_53") --
+    ("iac_storage_misconfigured",  {"rule_id_prefix": "checkov_storage_"}),
+    ("iac_network_exposed",        {"rule_id_prefix": "checkov_network_"}),
+    ("iac_encryption_missing",     {"rule_id_prefix": "checkov_encryption_"}),
+    ("iac_logging_missing",        {"rule_id_prefix": "checkov_logging_"}),
+    ("iac_storage_misconfigured",  {"rule_id_contains": "checkov_CKV_AWS_53"}),
+    ("iac_storage_misconfigured",  {"rule_id_contains": "checkov_CKV_AWS_54"}),
+    ("iac_storage_misconfigured",  {"rule_id_contains": "checkov_CKV_AWS_55"}),
+    ("iac_network_exposed",        {"rule_id_contains": "checkov_CKV_AWS_20"}),
+    ("iac_network_exposed",        {"rule_id_contains": "checkov_CKV_AWS_21"}),
+    ("iac_network_exposed",        {"rule_id_contains": "checkov_CKV_AWS_24"}),
+    ("iac_network_exposed",        {"rule_id_contains": "checkov_CKV_AWS_25"}),
+    ("iac_encryption_missing",     {"rule_id_contains": "checkov_encrypt"}),
+    ("iac_logging_missing",        {"rule_id_contains": "checkov_log_"}),
+    ("iac_logging_missing",        {"rule_id_contains": "checkov_CKV_AWS_14"}),
+    ("iac_logging_missing",        {"rule_id_contains": "checkov_CKV_AWS_15"}),
+
+    # -- IaC catch-all (any checkov finding not in specific rules above) --
+    ("iac_storage_misconfigured",  {"rule_id_prefix": "checkov_"}),
     ("insufficient_logging", {"rule_id_contains": "no-log"}),  # noqa: SIM114 — separate type
 
     # -- Semgrep: Debug / Error --
@@ -406,6 +541,19 @@ _CLASSIFICATION_RULES: list[tuple[str, dict]] = [
     ("dependency_cve_dos", {"rule_id_prefix": "osv_", "desc_contains": ("dos", "regex", "redos", "repeated", "coercion")}),
     ("dependency_cve_network", {"rule_id_prefix": "osv_"}),  # fallback for unclassified OSV
 
+    # -- Gitleaks secrets scanner (rule_ids like "gitleaks_aws-token", "gitleaks_jwt") --
+    ("hardcoded_secret",           {"rule_id_prefix": "gitleaks_"}),
+    ("cloud_credentials_exposed",  {"rule_id_contains": "gitleaks_aws"}),
+    ("cloud_credentials_exposed",  {"rule_id_contains": "gitleaks_google"}),
+    ("cloud_credentials_exposed",  {"rule_id_contains": "gitleaks_azure"}),
+    ("cloud_credentials_exposed",  {"rule_id_contains": "gitleaks_gitlab"}),
+    ("cloud_credentials_exposed",  {"rule_id_contains": "gitleaks_github"}),
+    ("cloud_credentials_exposed",  {"rule_id_contains": "gitleaks_slack"}),
+    ("jwt_exposed",                {"rule_id_contains": "gitleaks_jwt"}),
+    ("private_key_exposed",        {"rule_id_contains": "gitleaks_private-key"}),
+    ("private_key_exposed",        {"rule_id_contains": "gitleaks_ssh"}),
+    ("private_key_exposed",        {"rule_id_contains": "gitleaks_pem"}),
+    ("private_key_exposed",        {"rule_id_contains": "gitleaks_rsa"}),
     # -- Generic keyword fallbacks (checked against rule_id, then description) --
     ("hardcoded_secret", {"rule_id_contains": "password", "source_weight": 0.5}),
     ("hardcoded_secret", {"rule_id_contains": "credential", "source_weight": 0.5}),
@@ -418,6 +566,86 @@ _CLASSIFICATION_RULES: list[tuple[str, dict]] = [
 
 # Fallback for findings that don't match any classification
 _DEFAULT_TYPE = "dependency_cve_network"  # safe default
+
+# ---------------------------------------------------------------------------
+# REMEDIATION MAP — per finding-type remediation text
+# ---------------------------------------------------------------------------
+
+REMEDIATION_MAP: dict[str, str] = {
+    # Container / infra
+    "docker_root": "Add a non-root USER directive at the end of the Dockerfile (e.g. USER appuser). Never run containers as root.",
+    "docker_secret_exposed": "Remove hardcoded secrets from Dockerfiles. Use Docker build secrets or a secrets manager (e.g. HashiCorp Vault).",
+    "docker_unverified_image": "Pin container images to a specific digest (sha256:) and pull from trusted registries only.",
+    "docker_no_resource_limits": "Set CPU/memory limits in container runtime configuration or orchestrator deployment specs.",
+    "docker_privileged_mode": "Remove the --privileged flag. Grant only the capabilities the container actually needs (--cap-drop=ALL --cap-add=...).",
+    # Secrets / credentials
+    "hardcoded_secret": "Move secrets to environment variables (e.g. .env) or a secrets manager (Vault, AWS Secrets Manager). Never commit secrets.",
+    "jwt_exposed": "Rotate the exposed JWT immediately. Store signing keys in a secrets manager and never log or commit them.",
+    "private_key_exposed": "Revoke the exposed key immediately and generate a new one. Store private keys in a secrets manager with restricted access.",
+    "cloud_credentials_exposed": "Rotate the cloud credentials immediately. Use IAM roles or workload identity federation instead of long-lived keys.",
+    # Crypto
+    "tls_disabled": "Re-enable TLS verification. Set NODE_TLS_REJECT_UNAUTHORIZED=1 and never set rejectUnauthorized=false in production.",
+    "weak_hash": "Replace MD5/SHA-1 with SHA-256 or SHA-3 for hashing. Use bcrypt/argon2 for password storage.",
+    "weak_rng": "Replace Math.random() with crypto.randomBytes() (Node.js) or SecureRandom (Java). Never use non-cryptographic RNG for security.",
+    "hardcoded_crypto_key": "Move encryption keys to a key management system (KMS, Vault). Never hardcode keys in source code.",
+    "weak_cipher": "Replace DES/RC4 with AES-256-GCM or ChaCha20-Poly1305. Avoid ECB mode — use GCM or CBC with HMAC.",
+    # Injection
+    "sql_injection": "Replace string concatenation in SQL queries with parameterized queries or an ORM that uses prepared statements.",
+    "command_injection": "Use a safe API (e.g. execFile instead of exec) and validate/sanitize all user input before passing to shell commands.",
+    "ldap_injection": "Use parameterized LDAP queries (e.g. ldapjs with filters) and sanitize user input before constructing DN strings.",
+    "xss": "Use context-aware auto-escaping templates (React JSX, Handlebars) and set Content-Security-Policy headers. Never use dangerouslySetInnerHTML.",
+    "template_injection": "Use sandboxed template engines (e.g. Liquid, Handlebars partials) and never pass user input directly to eval-like functions.",
+    "log_injection": "Replace string interpolation in logging (util.format, console.log) with structured logging (pino, winston). Never let user input control format strings.",
+    # Access control / session
+    "csrf_missing": "Add CSRF tokens to all state-changing requests. Use SameSite=Strict cookies and CSRF middleware (e.g. csurf).",
+    "open_redirect": "Validate redirect URLs against an allowlist. Never redirect to user-supplied URL parameters without validation.",
+    "missing_authn": "Add authentication checks to all privileged endpoints. Use an auth middleware that runs before route handlers.",
+    "broken_authz": "Implement access control checks on every endpoint. Use a policy engine (e.g. CASL, Pundit) rather than inline checks.",
+    # Cookies / transport
+    "cookie_missing_httponly": "Add the HttpOnly flag to cookies that don't need client-side JS access. Set it via cookie options: { httpOnly: true }.",
+    "cookie_missing_secure": "Add the Secure flag to all cookies so they're only sent over HTTPS. Set { secure: true } in cookie options.",
+    "cookie_missing_samesite": "Set SameSite=Lax or SameSite=Strict on all cookies to prevent CSRF via cross-site requests.",
+    "plaintext_http": "Redirect all HTTP traffic to HTTPS using HSTS headers (Strict-Transport-Security). Configure a reverse proxy to terminate TLS.",
+    # Path / file
+    "path_traversal": "Validate and normalize file paths using path.resolve() and ensure they stay within an allowed base directory.",
+    "file_inclusion": "Restrict file includes to a whitelist of allowed paths. Never use user input to construct include paths.",
+    "unrestricted_file_upload": "Validate file type by MIME and magic bytes, limit file size, and store uploads outside the web root.",
+    # SSRF
+    "ssrf": "Restrict outbound HTTP to a whitelist of allowed hosts. Use a forward proxy and validate redirect targets.",
+    # Deserialization
+    "unsafe_deserialization": "Replace native serialization (JSON.parse with reviver, eval) with safe alternatives like schema-validated JSON.",
+    "prototype_pollution": "Use Object.create(null) for maps, freeze trusted objects, and validate object keys against an allowlist.",
+    # CVE / dependency
+    "dependency_cve_dos": "Update the affected package to the latest patched version. Run npm audit or pip-audit regularly.",
+    "dependency_cve_network": "Update the affected package to a version with a fix. If no fix exists, add a WAF rule or middleware to mitigate.",
+    "dependency_cve_data": "Update the affected package immediately. If a CVE allows data exfiltration, rotate any potentially exposed secrets.",
+    "dependency_cve_email": "Update the affected library. If immediate update isn't possible, restrict outbound SMTP to known relay hosts.",
+    # CI/CD / supply chain
+    "cicd_plaintext_secret": "Replace the hardcoded value with ${{ secrets.NAME }}. Add secret is the repository settings.",
+    "missing_sast_gate": "Add a SAST scanning step (CodeQL, Semgrep, Snyk) to CI/CD pull request workflows and block on high-severity findings.",
+    "unsigned_artifact_publish": "Add a signing step (cosign, GPG) before publish commands. Verify signatures in the deployment pipeline.",
+    # Repo / governance
+    "repo_public": "Review whether the repository should be private. If it must be public, ensure no secrets are committed.",
+    "branch_unprotected": "Enable branch protection rules: require PR reviews, status checks, and signed commits on the default branch.",
+    "missing_codeowners": "Add a CODEOWNERS file in .github/ to auto-assign PR reviewers based on code paths.",
+    "unsigned_commits": "Enable signed commit enforcement in branch protection settings. Configure GPG commit signing in git.",
+    "missing_security_policy": "Create a SECURITY.md file explaining how to responsibly report vulnerabilities.",
+    # Logging / monitoring
+    "sensitive_data_logged": "Remove sensitive data (PII, credentials) from logs. Use structured logging with redaction for known sensitive fields.",
+    "insufficient_logging": "Add structured logging for authentication events, access control failures, and data changes.",
+    # Data exposure
+    "pii_in_source": "Remove the hardcoded PII from source code. Use environment variables, config files excluded from version control, or a secrets manager.",
+    "pii_field_unencrypted": "Add column-level encryption (e.g. pgcrypto, Mongoose encrypt) for PII fields. Use AES-256-GCM or similar.",
+    "sensitive_category_data_detected": "Apply additional access controls and encryption for GDPR Art. 9 / DPDP Rule 4 special-category data fields.",
+    # IaC
+    "iac_storage_misconfigured": "Restrict public access to storage resources. Use bucket policies with least-privilege access and enable versioning.",
+    "iac_network_exposed": "Restrict security group ingress to specific IP ranges. Never use 0.0.0.0/0 for sensitive ports.",
+    "iac_encryption_missing": "Enable server-side encryption (AES-256 or AWS KMS) on storage and database resources in IaC templates.",
+    "iac_logging_missing": "Enable access logging and audit trails on all infrastructure resources (S3 access logs, CloudTrail, etc.).",
+    # SBOM / license
+    "copyleft_license_risk": "Review the dependency's license terms with legal. Consider replacing GPL/AGPL dependencies with permissively-licensed alternatives.",
+    "unmaintained_dependency": "Replace the package with an actively maintained alternative. If no alternative exists, fork and maintain internally.",
+}
 
 # Finding types that should NEVER carry GDPR/DPDP tags.
 # These are governance/infrastructure findings, not data protection ones.
@@ -432,6 +660,12 @@ GDPR_DPDP_EXCLUDED_TYPES = {
     "docker_unverified_image",
     "docker_no_resource_limits",
     "docker_privileged_mode",
+    "copyleft_license_risk",
+    "unmaintained_dependency",
+    "iac_network_exposed",
+    "iac_logging_missing",
+    "missing_sast_gate",
+    "unsigned_artifact_publish",
 }
 
 

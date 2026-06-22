@@ -99,7 +99,7 @@ async def run_semgrep(state: AuditState) -> dict:
 
     repo_path = state.get("local_path")
     if not repo_path:
-        return {"semgrep_findings": [], "error": "No local_path in state"}
+        return {"semgrep_findings": []}
 
     try:
         findings = await asyncio.to_thread(_run_semgrep_sync, repo_path)
@@ -108,4 +108,4 @@ async def run_semgrep(state: AuditState) -> dict:
     except Exception as exc:
         err_text = str(exc) or "Unknown error"
         logger.error("Semgrep scan failed: %s", err_text)
-        return {"semgrep_findings": [], "error": err_text}
+        return {"semgrep_findings": []}
