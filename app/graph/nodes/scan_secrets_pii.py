@@ -1,9 +1,11 @@
 import asyncio
+import json
 import logging
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 
 from app.graph.state import AuditState, Finding
 
@@ -312,11 +314,66 @@ def _run_gitleaks_scan(repo_path: str) -> list[Finding]:
         return []
 
     try:
-        result = subprocess.run(
-            [gitleaks, "detect", "--source", repo_path,
-             "--log-opts", "--all", "--report-format", "json", "--no-color"],
-            capture_output=True, text=True, timeout=300,
-        )
+        with tempfile.TemporaryDirectory(prefix="compliance-gitleaks-") as temp_dir:
+            report_path = os.path.join(temp_dir, "gitleaks-report.json")
+            result = subprocess.run(
+                [
+                    gitleaks,
+                    "detect",
+                    "--source",
+                    repo_path,
+                    "--log-opts",
+                    "--all",
+                    "--report-format",
+                    "json",
+                    "--report-path",
+                    report_path,
+                    "--no-color",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+
+            stdout = result.stdout or ""
+            stderr = result.stderr or ""
+            logger.info(
+                "Gitleaks rc=%s stdout_len=%s stderr_len=%s",
+                result.returncode,
+                len(stdout),
+                len(stderr),
+            )
+            if stdout:
+                logger.debug("Gitleaks stdout preview: %s", stdout[:500])
+            if stderr:
+                logger.debug("Gitleaks stderr preview: %s", stderr[:500])
+
+            # Gitleaks normally exits 1 when leaks are found and 0 when none
+            # are found. Parse the report for either code because behavior can
+            # differ between versions.
+            if result.returncode not in (0, 1):
+                logger.warning(
+                    "Gitleaks failed with exit code %s: %s",
+                    result.returncode,
+                    stderr[:500],
+                )
+                return []
+
+            if not os.path.isfile(report_path) or os.path.getsize(report_path) == 0:
+                if result.returncode == 1:
+                    logger.warning(
+                        "Gitleaks reported findings but produced no JSON report"
+                    )
+                else:
+                    logger.info("Gitleaks: no secrets found")
+                return []
+
+            try:
+                with open(report_path, encoding="utf-8") as report_file:
+                    leaks = json.load(report_file)
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning("Gitleaks: failed to read JSON report: %s", exc)
+                return []
     except subprocess.TimeoutExpired:
         logger.warning("Gitleaks scan timed out after 300s")
         return []
@@ -325,20 +382,6 @@ def _run_gitleaks_scan(repo_path: str) -> list[Finding]:
         return []
     except Exception as exc:
         logger.warning("Gitleaks scan failed: %s", exc)
-        return []
-
-    # Gitleaks exits 1 when it finds secrets, 0 when none found
-    stdout = result.stdout or ""
-    stderr = result.stderr or ""
-
-    if not stdout.strip():
-        logger.info("Gitleaks: no secrets found")
-        return []
-
-    try:
-        leaks = json.loads(stdout)
-    except json.JSONDecodeError:
-        logger.warning("Gitleaks: failed to parse JSON output: %s", stdout[:500])
         return []
 
     findings: list[Finding] = []

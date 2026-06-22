@@ -29,11 +29,7 @@ async def _fan_out(state: AuditState) -> dict:
 
 
 async def _scanner_merge(state: AuditState) -> dict:
-    """Merge barrier: increments the run counter.
-
-    The conditional edge waits until all 9 parallel scanner branches
-    have triggered this node, then proceeds to compliance_mapper once.
-    """
+    """Fan-in barrier reached after all parallel scanners complete."""
     return {"_mapper_run_count": 1}
 
 
@@ -80,26 +76,24 @@ def build_graph():
     graph.add_edge("fan_out", "scan_cicd_security")
     graph.add_edge("fan_out", "scan_data_classification")
 
-    # All 9 branches converge at scanner_merge (waits for every branch)
-    graph.add_edge("semgrep", "scanner_merge")
-    graph.add_edge("osv", "scanner_merge")
-    graph.add_edge("github", "scanner_merge")
-    graph.add_edge("scan_secrets_pii", "scanner_merge")
-    graph.add_edge("scan_repo_governance", "scanner_merge")
-    graph.add_edge("scan_sbom_license", "scanner_merge")
-    graph.add_edge("scan_iac_config", "scanner_merge")
-    graph.add_edge("scan_cicd_security", "scanner_merge")
-    graph.add_edge("scan_data_classification", "scanner_merge")
-
-    # Barrier: only proceed to compliance_mapper after all 9 branches
-    # have triggered scanner_merge (guarantees complete finding set).
-    def _all_scanners_complete(state: AuditState) -> str:
-        return "compliance_mapper" if state.get("_mapper_run_count", 0) >= 9 else END
-    graph.add_conditional_edges(
+    # A list-valued start edge is LangGraph's true AND-join: scanner_merge
+    # runs once, only after every scanner has completed. Multiple individual
+    # edges would behave as independent triggers rather than a counter barrier.
+    graph.add_edge(
+        [
+            "semgrep",
+            "osv",
+            "github",
+            "scan_secrets_pii",
+            "scan_repo_governance",
+            "scan_sbom_license",
+            "scan_iac_config",
+            "scan_cicd_security",
+            "scan_data_classification",
+        ],
         "scanner_merge",
-        _all_scanners_complete,
-        {"compliance_mapper": "compliance_mapper", END: END},
     )
+    graph.add_edge("scanner_merge", "compliance_mapper")
     graph.add_edge("compliance_mapper", "report_generator")
     graph.add_edge("report_generator", END)
 

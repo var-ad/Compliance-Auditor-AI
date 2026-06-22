@@ -2,6 +2,7 @@
 
 import pytest
 from langgraph.graph import END, StateGraph
+from typing import TypedDict
 
 from app.graph.state import AuditState
 
@@ -81,6 +82,63 @@ class TestGraphRouting:
         # LangGraph internal nodes
         assert "__start__" in nodes
         assert "__end__" in nodes
+
+    @pytest.mark.anyio
+    async def test_multi_scanner_fan_in_reaches_mapper_and_report(self):
+        """The join must wait for every scanner, then continue past the merge."""
+        class FanInState(TypedDict, total=False):
+            a: bool
+            b: bool
+            mapped: bool
+            report: str
+
+        graph = StateGraph(FanInState)
+        completed = []
+
+        async def start(_state):
+            return {}
+
+        async def scanner_a(_state):
+            completed.append("a")
+            return {"a": True}
+
+        async def scanner_b(_state):
+            completed.append("b")
+            return {"b": True}
+
+        async def merge(state):
+            assert state["a"] is True
+            assert state["b"] is True
+            completed.append("merge")
+            return {}
+
+        async def mapper(_state):
+            completed.append("mapper")
+            return {"mapped": True}
+
+        async def report(_state):
+            completed.append("report")
+            return {"report": "generated"}
+
+        graph.add_node("start", start)
+        graph.add_node("scanner_a", scanner_a)
+        graph.add_node("scanner_b", scanner_b)
+        graph.add_node("merge", merge)
+        graph.add_node("mapper", mapper)
+        graph.add_node("report", report)
+        graph.set_entry_point("start")
+        graph.add_edge("start", "scanner_a")
+        graph.add_edge("start", "scanner_b")
+        graph.add_edge(["scanner_a", "scanner_b"], "merge")
+        graph.add_edge("merge", "mapper")
+        graph.add_edge("mapper", "report")
+        graph.add_edge("report", END)
+
+        result = await graph.compile().ainvoke({})
+
+        assert result["mapped"] is True
+        assert result["report"] == "generated"
+        assert completed[-3:] == ["merge", "mapper", "report"]
 
 
 class TestRunAuditWrapper:

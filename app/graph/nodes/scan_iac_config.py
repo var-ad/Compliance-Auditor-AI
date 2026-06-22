@@ -26,10 +26,6 @@ _K8S_PATTERN = re.compile(
     re.MULTILINE,
 )
 
-# Skip dockerfile since semgrep already handles it via docker_root etc.
-# (checkov will be called with --skip-framework dockerfile)
-
-
 def _has_iac_files(repo_path: str) -> list[str]:
     """Scan repo for IaC files. Returns list of detected framework names.
 
@@ -102,31 +98,35 @@ def _parse_checkov_output(checkov_json: str) -> list[dict]:
         logger.warning("Checkov JSON parse failed: %s", exc)
         return results
 
-    # Checkov output structure varies: sometimes nested under "results"
-    # or "results/failed_checks" depending on version
-    failed_checks = data
-    if isinstance(data, dict):
-        failed_checks = (
-            data.get("results", {}).get("failed_checks", [])
-            or data.get("results", [])
-            or data.get("failed_checks", [])
-        )
-
-    if not isinstance(failed_checks, list):
-        return results
+    # A single framework returns a dict. Multiple frameworks return a list of
+    # those dicts, so flatten every failed_checks collection before mapping.
+    failed_checks: list[dict] = []
+    reports = data if isinstance(data, list) else [data]
+    for report in reports:
+        if not isinstance(report, dict):
+            continue
+        report_results = report.get("results", {})
+        if isinstance(report_results, dict):
+            checks = report_results.get("failed_checks", [])
+        elif isinstance(report_results, list):
+            checks = report_results
+        else:
+            checks = report.get("failed_checks", [])
+        if isinstance(checks, list):
+            failed_checks.extend(check for check in checks if isinstance(check, dict))
 
     for check in failed_checks:
-        if not isinstance(check, dict):
-            continue
-        check_id = check.get("check_id", "")
-        check_name = check.get("check_name", "")
+        check_id = str(check.get("check_id") or "")
+        check_name = str(check.get("check_name") or "")
         severity = _map_checkov_severity(
-            check.get("severity", ""),
-            check.get("check_id", ""),
+            check.get("severity"),
+            check_id,
         )
-        file_path = check.get("file_path", "")
-        guideline = check.get("guideline", "")
-        resource = check.get("resource", "")
+        file_path = str(
+            check.get("repo_file_path") or check.get("file_path") or ""
+        )
+        guideline = str(check.get("guideline") or "")
+        resource = str(check.get("resource") or "")
 
         results.append({
             "check_id": check_id,
@@ -140,9 +140,9 @@ def _parse_checkov_output(checkov_json: str) -> list[dict]:
     return results
 
 
-def _map_checkov_severity(severity: str, check_id: str) -> str:
+def _map_checkov_severity(severity: str | None, check_id: str) -> str:
     """Map Checkov severity to our 4-tier system."""
-    sev = severity.lower()
+    sev = str(severity or "").lower()
     if sev in ("critical", "high"):
         return "high"
     if sev in ("medium", "moderate"):
@@ -154,8 +154,8 @@ def _map_checkov_severity(severity: str, check_id: str) -> str:
 
 def _classify_checkov_check(check_id: str, check_name: str) -> str:
     """Map a Checkov check to a finding_type key in CONTROL_MAP."""
-    cid = check_id.lower()
-    cname = check_name.lower()
+    cid = str(check_id or "").lower()
+    cname = str(check_name or "").lower()
 
     # Storage misconfiguration (S3 bucket, public access, etc.)
     if "s3" in cid and any(w in cname for w in ("public", "acl", "policy", "versioning", "encryption")):
@@ -242,9 +242,7 @@ async def run_scan_iac_config(state: AuditState) -> dict:
     try:
         result = await asyncio.to_thread(
             lambda: subprocess.run(
-                [checkov, "-d", repo_path, "--json",
-                 "--skip-framework", "dockerfile",
-                 "--compact"],
+                [checkov, "-d", repo_path, "-o", "json", "--compact"],
                 capture_output=True, text=True, timeout=300,
             )
         )
@@ -258,12 +256,34 @@ async def run_scan_iac_config(state: AuditState) -> dict:
         logger.warning("Checkov scan failed: %s", exc)
         return {"iac_findings": [], "iac_scan_skipped": False}
 
-    if not result.stdout.strip():
-        logger.info("Checkov: no findings for %s", repo_path)
+    stdout = result.stdout or ""
+    stderr = result.stderr or ""
+    logger.info(
+        "Checkov rc=%s stdout_len=%s stderr_len=%s",
+        result.returncode,
+        len(stdout),
+        len(stderr),
+    )
+    if stdout:
+        logger.debug("Checkov stdout preview: %s", stdout[:1000])
+    if stderr:
+        logger.debug("Checkov stderr preview: %s", stderr[:1000])
+
+    # Checkov exits 1 when checks fail (findings exist), 0 when all pass.
+    if result.returncode not in (0, 1):
+        logger.warning(
+            "Checkov failed with exit code %s: %s",
+            result.returncode,
+            stderr[:1000],
+        )
+        return {"iac_findings": [], "iac_scan_skipped": False}
+
+    if not stdout.strip():
+        logger.info("Checkov produced no JSON output for %s", repo_path)
         return {"iac_findings": [], "iac_scan_skipped": False}
 
     # Step 3: Parse and map findings
-    parsed = _parse_checkov_output(result.stdout)
+    parsed = _parse_checkov_output(stdout)
     findings: list[Finding] = []
 
     for item in parsed:
