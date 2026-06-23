@@ -1,4 +1,5 @@
 import logging
+import re
 
 from app.graph.state import AuditState, Finding, MappedControl
 
@@ -521,7 +522,16 @@ def _strip_path_prefix(findings: list[Finding], local_path: str) -> None:
             continue
         normalized = fp.replace("\\", "/")
         if normalized.startswith(prefix):
-            finding["file_path"] = normalized[len(prefix):]
+            normalized = normalized[len(prefix):]
+
+        # Strip Linux and Windows temp clone prefixes even when local_path was
+        # not an exact string match for the scanner output.
+        normalized = re.sub(r"^/tmp/tmp[^/]+/", "", normalized)
+        normalized = re.sub(r"^.*?[/\\]Temp[/\\]tmp[^/\\]+[/\\]", "", normalized)
+        stripped = normalized.lstrip("/")
+
+        if stripped != fp:
+            finding["file_path"] = stripped
             logger.debug("Stripped path: %s -> %s", fp, finding["file_path"])
 
 

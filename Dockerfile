@@ -17,7 +17,7 @@ FROM python:3.11-slim AS build
 WORKDIR /app
 
 # Install uv (fast package manager)
-RUN pip install --no-cache-dir uv==0.5.0
+RUN pip install --no-cache-dir uv==0.9.17
 
 # Copy dependency manifests first for Docker layer caching
 COPY pyproject.toml uv.lock ./
@@ -31,13 +31,19 @@ RUN uv sync --no-dev --no-install-project
 FROM python:3.11-slim AS runtime
 
 # OCI best practice: create a non-root user
-RUN groupadd --gid 10001 appuser \
+RUN apt-get update \
+    && apt-get install --no-install-recommends --yes ca-certificates git \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 appuser \
     && useradd --uid 10001 --gid appuser --shell /bin/bash --create-home appuser
 
 WORKDIR /app
 
 # Copy installed packages from build stage
 COPY --from=build /app/.venv /app/.venv
+ENV PATH="/app/.venv/bin:${PATH}" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
 
 # Copy application code
 COPY app/ ./app/
@@ -55,8 +61,8 @@ USER appuser
 
 # Health check — OCI load balancers poll this endpoint
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD uv run python -c "import httpx; httpx.get('http://localhost:8080/health', timeout=5)" || exit 1
+    CMD python -c "import httpx; httpx.get('http://localhost:8080/health', timeout=5).raise_for_status()" || exit 1
 
 # Use exec form for proper signal handling (PID 1)
 # Bind to 0.0.0.0:8080 (OCI standard port)
-CMD ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--proxy-headers", "--forwarded-allow-ips=*"]

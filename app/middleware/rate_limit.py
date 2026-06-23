@@ -6,7 +6,7 @@ from starlette.responses import JSONResponse
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Simple in-memory rate limiter for the /api/audit endpoint.
+    """Simple in-memory rate limiter for audit-creation endpoints.
 
     Limits each IP to RATE_LIMIT requests per WINDOW_SECONDS.
     Periodically purges stale entries to prevent unbounded memory growth.
@@ -15,13 +15,22 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     RATE_LIMIT = 10
     WINDOW_SECONDS = 60
     CLEANUP_THRESHOLD = 1000  # purge all IPs when tracked IPs exceed this
+    AUDIT_CREATION_PATHS = {
+        "/api/audit",
+        "/api/audit/start",
+        "/api/audit/upload",
+        "/api/audit/local",
+    }
 
     def __init__(self, app):
         super().__init__(app)
         self._requests: dict[str, list[float]] = {}
 
     async def dispatch(self, request: Request, call_next):
-        if request.url.path == "/api/audit" and request.method == "POST":
+        if (
+            request.url.path in self.AUDIT_CREATION_PATHS
+            and request.method == "POST"
+        ):
             client_ip = request.client.host if request.client else "unknown"
             now = time.time()
             window_start = now - self.WINDOW_SECONDS

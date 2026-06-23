@@ -37,6 +37,8 @@ RAW_CONTROL_MAP: dict[str, list[str]] = {
     "docker_unverified_image": ["SOC2:CC7.1", "ISO:A.12.5.1"],
     "docker_no_resource_limits": ["SOC2:CC7.2", "ISO:A.12.1.3"],
     "docker_privileged_mode": ["SOC2:CC6.1", "ISO:A.9.2.3"],
+    "iac_docker_healthcheck": ["SOC2:CC7.2", "ISO:A.12.1.3"],
+    "iac_docker_user": ["SOC2:CC6.1", "ISO:A.9.2.3"],
     # ------------------------------------------------------------------ #
     # SECRETS & CREDENTIALS                                              #
     # ------------------------------------------------------------------ #
@@ -578,6 +580,8 @@ REMEDIATION_MAP: dict[str, str] = {
     "docker_unverified_image": "Pin container images to a specific digest (sha256:) and pull from trusted registries only.",
     "docker_no_resource_limits": "Set CPU/memory limits in container runtime configuration or orchestrator deployment specs.",
     "docker_privileged_mode": "Remove the --privileged flag. Grant only the capabilities the container actually needs (--cap-drop=ALL --cap-add=...).",
+    "iac_docker_healthcheck": "Add a HEALTHCHECK instruction to your Dockerfile. Example: HEALTHCHECK CMD curl -f http://localhost/ || exit 1",
+    "iac_docker_user": "Add a non-root USER directive at the end of your Dockerfile. Example: RUN useradd -r appuser && USER appuser",
     # Secrets / credentials
     "hardcoded_secret": "Move secrets to environment variables (e.g. .env) or a secrets manager (Vault, AWS Secrets Manager). Never commit secrets.",
     "jwt_exposed": "Rotate the exposed JWT immediately. Store signing keys in a secrets manager and never log or commit them.",
@@ -660,6 +664,8 @@ GDPR_DPDP_EXCLUDED_TYPES = {
     "docker_unverified_image",
     "docker_no_resource_limits",
     "docker_privileged_mode",
+    "iac_docker_healthcheck",
+    "iac_docker_user",
     "copyleft_license_risk",
     "unmaintained_dependency",
     "iac_network_exposed",

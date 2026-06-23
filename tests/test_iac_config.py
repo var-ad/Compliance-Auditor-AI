@@ -60,6 +60,17 @@ def test_parse_checkov_accepts_null_optional_fields():
     assert parsed[0]["resource"] == ""
 
 
+def test_docker_checkov_rules_get_docker_specific_finding_types():
+    assert scan_iac_config._classify_checkov_check(
+        "CKV_DOCKER_2",
+        "Ensure that HEALTHCHECK instructions have been added to container images",
+    ) == "iac_docker_healthcheck"
+    assert scan_iac_config._classify_checkov_check(
+        "CKV_DOCKER_3",
+        "Ensure that a user for the container has been created",
+    ) == "iac_docker_user"
+
+
 @pytest.mark.anyio
 async def test_dockerfile_is_not_excluded_from_checkov(monkeypatch, tmp_path):
     (tmp_path / "Dockerfile").write_text("FROM alpine\n", encoding="utf-8")

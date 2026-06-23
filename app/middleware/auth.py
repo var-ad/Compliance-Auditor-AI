@@ -1,3 +1,5 @@
+import secrets
+
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
@@ -13,13 +15,13 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
     """
 
     async def dispatch(self, request: Request, call_next):
-        if request.url.path == "/health":
+        if request.method == "OPTIONS" or request.url.path == "/health":
             return await call_next(request)
 
         if request.url.path.startswith("/api/"):
             if AUDIT_API_KEY:
                 api_key = request.headers.get("X-API-Key")
-                if not api_key or api_key != AUDIT_API_KEY:
+                if not api_key or not secrets.compare_digest(api_key, AUDIT_API_KEY):
                     return JSONResponse(
                         status_code=401,
                         content={"error": "Unauthorized"},

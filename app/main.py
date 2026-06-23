@@ -3,9 +3,14 @@ import shutil
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
 # Import config first so load_dotenv() runs once
-from app.utils import config  # noqa: F401
+from app.utils.config import (
+    ALLOWED_HOSTS,
+    CORS_ORIGIN_REGEX,
+    CORS_ORIGINS,
+)
 
 from app.middleware.auth import APIKeyMiddleware
 from app.middleware.rate_limit import RateLimitMiddleware
@@ -38,17 +43,19 @@ app = FastAPI(title="Compliance Auditor")
 # Check CLI tools at startup
 _missing_tools = check_tools()
 
-# CORS — allow all origins in dev; tighten for production
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
+# Restrict host headers before requests reach application routes.
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 app.add_middleware(APIKeyMiddleware)
 app.add_middleware(RateLimitMiddleware)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_origin_regex=CORS_ORIGIN_REGEX,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-API-Key"],
+)
 
 app.include_router(router, prefix="/api")
 

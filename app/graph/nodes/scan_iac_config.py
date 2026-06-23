@@ -157,6 +157,14 @@ def _classify_checkov_check(check_id: str, check_name: str) -> str:
     cid = str(check_id or "").lower()
     cname = str(check_name or "").lower()
 
+    # Dockerfile hardening. Keep these ahead of the generic IaC buckets so
+    # Docker checks do not inherit S3/storage remediations.
+    if "docker" in cid:
+        if "healthcheck" in cname or cid.endswith("_2"):
+            return "iac_docker_healthcheck"
+        if "user" in cname or "root" in cname or cid.endswith("_3"):
+            return "iac_docker_user"
+
     # Storage misconfiguration (S3 bucket, public access, etc.)
     if "s3" in cid and any(w in cname for w in ("public", "acl", "policy", "versioning", "encryption")):
         return "iac_storage_misconfigured"

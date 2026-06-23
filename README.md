@@ -65,6 +65,37 @@ Overall: SOC2×0.35 + ISO27001×0.25 + GDPR×0.25 + DPDP×0.15
 | `GITHUB_TOKEN` | No | Higher rate limits, org-level checks |
 | `SUPABASE_URL` | No | Cache + RAG vector store |
 | `SUPABASE_KEY` | No | Supabase API key |
+| `AUDIT_API_KEY` | Yes in production | Shared access key entered in the frontend |
+| `CORS_ORIGINS` | Yes in production | Comma-separated allowed browser origins |
+| `CORS_ORIGIN_REGEX` | No | Optional regex for Vercel preview origins |
+| `ALLOWED_HOSTS` | Yes in production | Comma-separated accepted HTTP hostnames |
+
+## OCI Deployment
+
+The production container listens on port `8080`. On an OCI VM:
+
+```bash
+cp .env.example .env
+# Fill in secrets, then:
+docker compose -f compose.production.yml up -d --build
+```
+
+The compose file binds the API to `127.0.0.1:8080`. Put Nginx in front of it
+using `nginx.conf.example`, create an `A` record for `auditor.varad.fyi`
+pointing to the OCI public IP, and issue TLS with Certbot:
+
+```bash
+sudo certbot --nginx -d auditor.varad.fyi
+```
+
+OCI networking must allow inbound TCP `80` and `443`; port `8080` should
+remain private. Production CORS defaults to
+`https://complianceauditor.varad.fyi` and local Vite development.
+
+Set `AUDIT_API_KEY` to a strong, random value on OCI. Users enter it in the
+frontend, which keeps it in tab-scoped session storage and sends it as the
+`X-API-Key` header. Never put this key in a `VITE_*` variable because those
+values are embedded in the public frontend bundle.
 
 ## Optional CLI Tools
 
